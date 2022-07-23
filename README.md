@@ -5,8 +5,9 @@ HikariCp是一个效率非常高的连接池.这里简单展示了它的连接�
 ### 使用方式
 
 1. 替换数据源
-2. 启动服务
-3. 访问 http://localhost:8081/get
+2. 替换Controller中查询语句
+3. 启动服务
+4. 访问 http://localhost:8081/get
 
 
 ### HikariCP连接超时问题:
