@@ -11,6 +11,7 @@ HikariCp是一个效率非常高的连接池.这里简单展示了它的连接�
 
 
 ### HikariCP连接超时问题:
+
 ```
 2022-07-23 11:10:48.805  INFO 17080 --- [nio-8081-exec-1] o.a.c.c.C.[Tomcat].[localhost].[/]       : Initializing Spring DispatcherServlet 'dispatcherServlet'
 2022-07-23 11:10:48.806  INFO 17080 --- [nio-8081-exec-1] o.s.web.servlet.DispatcherServlet        : Initializing Servlet 'dispatcherServlet'
@@ -83,7 +84,9 @@ java.sql.SQLTransientConnectionException: selfHikariCP - Connection is not avail
 	at java.lang.Thread.run(Thread.java:748) [na:1.8.0_291]
 ```
 
-现象描述: 当请求次数超过连接池配置的最大连接数时就开始报请求获取超时异常.根据异常显示就是连接池里的连接有问题
+现象描述:
+
+> 当请求次数超过连接池配置的最大连接数时就开始报请求获取超时异常.根据异常显示就是连接池里的连接有问题
 
 代码调用情况:
 
@@ -124,23 +127,102 @@ queryForStream: 实现方式
     }
 ```
 
-该方法涉及两个连接释放的操作,用于归还在用的连接.    
-1 stream().onClose(..) 重写了流的关闭方法    
+ResultSetSpliterator: 定义流处理规则.它是queryForStream流处理方法的核心.它会获取ResultSet,每一次流获取都会触发ResultSet.next(),
+这样每次处理一条记录,实现大数据量操作中内存的尽量少占用.避免如一些图片处理等list操作,一次性将结果集全部堆到内存中,引起内存溢出
+```
+    private static class ResultSetSpliterator<T> implements Spliterator<T> {
+        private final ResultSet rs;
+        private final RowMapper<T> rowMapper;
+        private int rowNum = 0;
+
+        public ResultSetSpliterator(ResultSet rs, RowMapper<T> rowMapper) {
+            this.rs = rs;
+            this.rowMapper = rowMapper;
+        }
+
+        public boolean tryAdvance(Consumer<? super T> action) {
+            try {
+                if (this.rs.next()) {
+                    action.accept(this.rowMapper.mapRow(this.rs, this.rowNum++));
+                    return true;
+                } else {
+                    return false;
+                }
+            } catch (SQLException var3) {
+                throw new InvalidResultSetAccessException(var3);
+            }
+        }
+
+       ...
+    }
+```
+
+该方法涉及两个连接释放的操作,用于归还在用的连接.
+1 stream().onClose(..) 重写了流的关闭方法
 2 execute(new StreamStatementCallback(), false)
 
 execute方法中如果第二个参数为true,则会在方法结束前触发连接释放,这里明显没有使用该方式释放连接.    
-原因也很简单,如果连接释放,会造成无法在业务代码中获取到Stream结果流,Stream流是实时读取连接
+原因也很简单,因为ResultSetSpliterator内部类需要获取ResultSet数据,如果连接释放就无法ResultSet中的数据
+
+这里有一个匿名方法定义: 它是整个流处理连接关闭的关键
+```
+	onClose(() -> {
+		JdbcUtils.closeResultSet(rs);
+		JdbcUtils.closeStatement(stmt);
+		DataSourceUtils.releaseConnection(con, JdbcTemplate.this.getDataSource());
+	})
+```
+
+onClose()是BaseStream的实现方法,该方法用于关闭ResultSet,Statement和释放DataSource.而此方法需要显示调用,由于流处理的特殊性,
+jdbcTemplate中没有实现自动触发该方法的调用.
+
+```
+// 流对象的基本接口,用于定义元素序列化和并行聚合操作的顺序
+java.util.stream.BaseStream {
+
+     /**
+        接收一个额外的关闭处理器(close handler)并返回相同的流对象(equivalent stream).所有的关闭处理器会在close()方法被调用时触发,执行顺序取决于添加顺序.
+        前面的关闭处理器异常不影响其他关闭处理执行.如果有关闭处理器抛出异常,会被延迟到close()调用,多个异常会被合并抛出.
+     */
+    S onClose(Runnable closeHandler);
+
+     // 关闭流.触发当前流处理(stream pipeline)上的所有关闭处理器(close handlers)
+    @Override
+    void close();
+}
+```
+
+故:
+
+jdbcTemplate.queryForStream 方法调用触发的异常是因为连接池中的连接一直被占用,无法释放,造成连接枯竭而发生连接获取时的超时异常.
+解决方法也很简单:
+
+只需要在返回的流结果上调用close方法即可:
+
+```
+       Stream<MyBean> objectStream = jdbcTemplate.queryForStream("SELECT * FROM BD_PSNBASDOC", new BeanPropertyRowMapper<>(MyBean.class));
+        objectStream.forEach(data -> {
+            System.out.println(data.getPhoto());
+        });
+        objectStream.close();//点睛之笔
+```
+
+### 代码示例
+
+[hikari_timeout](https://github.com/3fong/hikari_timeout.git)
 
 
-这里有一个匿名方法定义:    
-它是整个流处理连接关闭的关键
-```
-		onClose(() -> {
-			JdbcUtils.closeResultSet(rs);
-			JdbcUtils.closeStatement(stmt);
-			DataSourceUtils.releaseConnection(con, JdbcTemplate.this.getDataSource());
-		})
-```
+
+
+
+
+
+
+
+
+
+
+
 
 
 
